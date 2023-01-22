@@ -141,8 +141,11 @@ func (b PostgresBackend) QueryEventsUnion(filters nostr.Filters) (events []nostr
     FROM event WHERE ` + strings.Join(conditions, " AND ") + " ORDER BY created_at DESC LIMIT ?)"
 		queries = append(queries, query)
 	}
-	query := b.DB.Rebind(strings.Join(queries, " UNION "))
-	rows, err := b.DB.Query(query, params...)
+	query := strings.Join(queries, "\nUNION\n")
+	if len(queries) > 1 {
+		query += "\nORDER BY created_at DESC"
+	}
+	rows, err := b.DB.Query(b.DB.Rebind(query), params...)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("failed to fetch events using query %q: %w", query, err)
 	}
