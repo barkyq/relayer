@@ -80,6 +80,11 @@ type Storage interface {
 	SaveEvent(event *nostr.Event) error
 }
 
+// UnionQuerier gathers all filters into a single SQL query using UNION
+type UnionQuerier interface {
+	QueryEventsUnion(filters nostr.Filters) (events []nostr.Event, err error)
+}
+
 // AdvancedQuerier methods are called before and after [Storage.QueryEvents].
 type AdvancedQuerier interface {
 	BeforeQuery(*nostr.Filter)

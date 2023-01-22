@@ -42,6 +42,7 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 	store := s.relay.Storage()
 	advancedDeleter, _ := store.(AdvancedDeleter)
 	advancedQuerier, _ := store.(AdvancedQuerier)
+	unionQuerier, isUnionQuerier := store.(UnionQuerier)
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -185,20 +186,21 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 
-					filters := make(nostr.Filters, len(request)-2)
-					for i, filterReq := range request[2:] {
+					filters := make(nostr.Filters, 0)
+					events := make([]nostr.Event, 0)
+					for _, filterReq := range request[2:] {
+						var filter nostr.Filter
 						if err := json.Unmarshal(
 							filterReq,
-							&filters[i],
+							&filter,
 						); err != nil {
 							notice = "failed to decode filter"
 							return
 						}
 
-						filter := &filters[i]
-
 						// prevent kind-4 events from being returned to unauthed users,
 						//   only when authentication is a thing
+						//   unauthorized filters for kind-4 events will be skipped
 						if _, ok := s.relay.(Auther); ok {
 							if slices.Contains(filter.Kinds, 4) {
 								senders := filter.Authors
@@ -206,49 +208,63 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 								switch {
 								case ws.authed == "":
 									// not authenticated
-									notice = "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"
-									return
+									ws.WriteJSON([]string{"NOTICE", "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"})
+									continue
 								case len(senders) == 1 && len(receivers) < 2 && (senders[0] == ws.authed):
 									// allowed filter: ws.authed is sole sender (filter specifies one or all receivers)
 								case len(receivers) == 1 && len(senders) < 2 && (receivers[0] == ws.authed):
 									// allowed filter: ws.authed is sole receiver (filter specifies one or all senders)
 								default:
 									// restricted filter: do not return any events,
-									//   even if other elements in filters array were not restricted).
+									//   even if other elements in filters array were not restricted.
 									//   client should know better.
-									notice = "restricted: authenticated user does not have authorization for requested filters."
-									return
+									ws.WriteJSON([]string{"NOTICE", "restricted: authenticated user does not have authorization for requested filters."})
+									continue
 								}
 							}
 						}
-
+						filters = append(filters, filter)
 						if advancedQuerier != nil {
-							advancedQuerier.BeforeQuery(filter)
+							advancedQuerier.BeforeQuery(&filter)
 						}
+						if !isUnionQuerier {
+							evs, err := store.QueryEvents(&filter)
+							if err != nil {
+								s.Log.Errorf("store: %v", err)
+								continue
+							}
 
-						events, err := store.QueryEvents(filter)
-						if err != nil {
-							s.Log.Errorf("store: %v", err)
-							continue
-						}
+							// this block should not trigger if the SQL query is well-written.
+							// other implementations may be broken, and this ensures the client
+							// won't be bombarded.
+							if filter.Limit > 0 && len(evs) > filter.Limit {
+								evs = evs[0:filter.Limit]
+							}
 
-						if advancedQuerier != nil {
-							advancedQuerier.AfterQuery(events, filter)
-						}
-
-						// this block should not trigger if the SQL query accounts for filter.Limit
-						// other implementations may be broken, and this ensures the client
-						// won't be bombarded.
-						if filter.Limit > 0 && len(events) > filter.Limit {
-							events = events[0:filter.Limit]
-						}
-
-						for _, event := range events {
-							ws.WriteJSON([]interface{}{"EVENT", id, event})
+							// AdvancedQuerier.AfterQuery is incompatible with
+							// UnionQuerier since it assumes each slice of events
+							// is associated to a single filter
+							if advancedQuerier != nil {
+								advancedQuerier.AfterQuery(evs, &filter)
+							}
+							// add to events which will be written to user
+							events = append(events, evs...)
 						}
 					}
-					// moved EOSE out of for loop.
-					// otherwise subscriptions may be cancelled too early
+					if isUnionQuerier {
+						var err error
+						// events are set in one-shot
+						events, err = unionQuerier.QueryEventsUnion(filters)
+						if err != nil {
+							s.Log.Errorf("store: %v", err)
+							return
+						}
+					}
+					// send the events
+					for _, event := range events {
+						ws.WriteJSON([]interface{}{"EVENT", id, event})
+					}
+					// stored events are done writing, so send EOSE
 					ws.WriteJSON([]interface{}{"EOSE", id})
 					setListener(id, ws, filters)
 				case "CLOSE":
